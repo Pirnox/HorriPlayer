@@ -1,5 +1,114 @@
+mod audio;
+
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::http::Response;
+use tauri::State;
+
+use audio::probe::{probe_file, TrackInfo};
+use audio::{AudioEngine, EngineState};
+
+/// The engine is created lazily: building it opens the output device, and we
+/// only want to do that once the UI actually plays something.
+#[derive(Default)]
+struct AudioState(Mutex<Option<std::sync::Arc<AudioEngine>>>);
+
+fn engine(
+    state: &State<'_, AudioState>,
+    app: &tauri::AppHandle,
+) -> Result<std::sync::Arc<AudioEngine>, String> {
+    let mut slot = state.0.lock().map_err(|_| "audio state poisoned")?;
+    if let Some(e) = slot.as_ref() {
+        return Ok(std::sync::Arc::clone(e));
+    }
+    let created = std::sync::Arc::new(AudioEngine::new(app.clone())?);
+    *slot = Some(std::sync::Arc::clone(&created));
+    Ok(created)
+}
+
+#[tauri::command]
+fn audio_load(
+    path: String,
+    autoplay: bool,
+    state: State<'_, AudioState>,
+    app: tauri::AppHandle,
+) -> Result<u64, String> {
+    engine(&state, &app)?.load(&path, autoplay)
+}
+
+#[tauri::command]
+fn audio_set_next(
+    path: Option<String>,
+    state: State<'_, AudioState>,
+    app: tauri::AppHandle,
+) -> Result<u64, String> {
+    engine(&state, &app)?.set_next(path.as_deref())
+}
+
+#[tauri::command]
+fn audio_play(state: State<'_, AudioState>, app: tauri::AppHandle) -> Result<(), String> {
+    engine(&state, &app)?.play()
+}
+
+#[tauri::command]
+fn audio_pause(state: State<'_, AudioState>, app: tauri::AppHandle) -> Result<(), String> {
+    engine(&state, &app)?.pause()
+}
+
+#[tauri::command]
+fn audio_stop(state: State<'_, AudioState>, app: tauri::AppHandle) -> Result<(), String> {
+    engine(&state, &app)?.stop()
+}
+
+#[tauri::command]
+fn audio_seek(
+    position: f64,
+    state: State<'_, AudioState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    engine(&state, &app)?.seek(position)
+}
+
+#[tauri::command]
+fn audio_set_volume(
+    volume: f32,
+    state: State<'_, AudioState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    engine(&state, &app)?.set_volume(volume);
+    Ok(())
+}
+
+#[tauri::command]
+fn audio_set_eq(
+    gains: Vec<f32>,
+    preamp: f32,
+    enabled: bool,
+    state: State<'_, AudioState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    engine(&state, &app)?.set_eq(&gains, preamp, enabled);
+    Ok(())
+}
+
+#[tauri::command]
+fn audio_state(state: State<'_, AudioState>, app: tauri::AppHandle) -> Result<EngineState, String> {
+    Ok(engine(&state, &app)?.state())
+}
+
+/// Read tags, cover art and stream details for a batch of files. Runs off the
+/// UI thread; unreadable files are skipped rather than failing the whole batch.
+#[tauri::command]
+async fn audio_probe(paths: Vec<String>) -> Result<Vec<TrackInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .iter()
+            .filter_map(|p| probe_file(p).ok())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
 
 /// Decode base64url (no padding) without pulling in a crate.
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -149,6 +258,8 @@ pub fn run() {
                 responder.respond(proxy_audio(b64, range).await);
             });
         })
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AudioState::default())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -159,7 +270,19 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![http_get_text])
+        .invoke_handler(tauri::generate_handler![
+            http_get_text,
+            audio_load,
+            audio_set_next,
+            audio_play,
+            audio_pause,
+            audio_stop,
+            audio_seek,
+            audio_set_volume,
+            audio_set_eq,
+            audio_state,
+            audio_probe
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

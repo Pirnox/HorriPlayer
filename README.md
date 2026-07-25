@@ -5,13 +5,23 @@ desktop app (Tauri + Rust) and, unchanged, as a single HTML file in a browser.
 
 ## Features
 
-- **Local files** — MP3, FLAC, WAV, OGG/Opus, M4A/AAC, WebM. Tags and cover art
-  are read by built-in ID3v2 and FLAC parsers, so metadata works offline.
+- **Native audio engine (desktop)** — Symphonia decodes, cpal plays, and the
+  whole path runs in Rust off the UI thread. Lossless FLAC, ALAC, WAV, AIFF and
+  CAF decode bit-perfect; MP3, AAC, Vorbis, Opus and ADPCM are supported too.
+  Gapless track changes, sample-rate conversion only when the device needs it,
+  and the format of what is playing is shown in the player bar.
+- **Local files** — added through a native file picker; tags, cover art, sample
+  rate and bit depth come from the same decoder that plays the file. The browser
+  build falls back to `<audio>` with built-in ID3v2/FLAC tag parsers.
 - **Servers** — Subsonic/Navidrome libraries: albums, artists, playlists, songs,
   search. In the desktop app requests go through Rust (`reqwest`) with real HTTP
   errors and timeouts; the browser build falls back to JSONP.
 - **10-band equalizer** — 31 Hz to 16 kHz, preamp, 8 presets, settings persist.
-- **Spectrum visualizer** — Canvas2D, follows the accent colour.
+  RBJ biquads, running in the audio callback in the desktop build and in Web
+  Audio in the browser. A flat setting is bypassed entirely, so it stays
+  bit-transparent unless you actually move a slider.
+- **Spectrum visualizer** — Canvas2D, follows the accent colour. Bars come from
+  an FFT in Rust on the desktop, from an AnalyserNode in the browser.
 - **Lyrics** — synced lyrics from the server (OpenSubsonic) or LRCLIB, with the
   current line highlighted; click a line to seek there.
 - **Themes** — Dark / OLED / Light plus six accent colours.
@@ -24,7 +34,11 @@ desktop app (Tauri + Rust) and, unchanged, as a single HTML file in a browser.
 | --- | --- |
 | `index.html` | The whole UI and player. **Source of truth** — edit this file. |
 | `ui/index.html` | Build input for Tauri. A copy of `index.html`. |
-| `src-tauri/src/lib.rs` | Rust side: HTTP for the Subsonic API, `hpaudio` stream proxy. |
+| `src-tauri/src/lib.rs` | Tauri commands: Subsonic HTTP, `hpaudio` proxy, audio transport. |
+| `src-tauri/src/audio/mod.rs` | Engine: decoder, output and monitor threads. |
+| `src-tauri/src/audio/eq.rs` | Ten-band biquad equalizer. |
+| `src-tauri/src/audio/probe.rs` | Tags, cover art and stream details. |
+| `src-tauri/src/audio/http_source.rs` | Seekable HTTP source for server streams. |
 | `src-tauri/tauri.conf.json` | Window, bundle and app identity. |
 
 After editing `index.html`, copy it into `ui/` before building:
@@ -56,19 +70,24 @@ installer under `src-tauri/target/release/bundle/nsis/`.
 cd src-tauri && cargo test --lib
 ```
 
-## Why audio is routed through two elements
+## Two playback paths
 
-Cross-origin media piped through `createMediaElementSource` is silenced by the
-Web Audio API when the server sends no CORS headers. So local files (and, in the
-desktop app, streams proxied through the Rust `hpaudio` protocol) play on an
-element wired into the equalizer graph, while unproxied server streams play on a
-plain element — audible, but without EQ or spectrum. The proxy forwards Range
-requests, so seeking still works.
+The desktop build never uses `<audio>`: `Player` in the UI forwards transport
+calls to the Rust engine and renders state from the `audio:tick` event it emits
+~30×/s. The browser build keeps the older path, where cross-origin media piped
+through `createMediaElementSource` is silenced without CORS headers — so there,
+local files play on an element wired into the Web Audio graph while server
+streams play on a plain element, audible but without EQ or spectrum. The
+`hpaudio` proxy exists for that browser-shaped limitation and still serves as
+the fallback if the native engine cannot open a stream.
+
+Playback position survives gapless changes because the decoder pushes markers
+onto the same frame timeline the output callback counts on, rather than relying
+on a counter that a track change would invalidate.
 
 ## Status
 
-Working: everything listed above, on Windows.
+Working on Windows: everything listed above.
 
-Planned: a native Rust audio engine (Symphonia + cpal) for ALAC/AIFF and other
-formats, gapless playback and DSP in Rust; Linux packaging (AppImage/deb);
-auto-updates.
+Planned: Linux packaging (AppImage/deb) and auto-updates. WavPack, Musepack and
+APE are not supported — Symphonia has no decoders for them.

@@ -119,6 +119,7 @@
   .pb-now .tx{min-width:0}
   .pb-now .tx .t{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pb-now .tx .a{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pb-now .tx .q{font-size:10px;color:var(--accent);letter-spacing:.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
   .pb-center{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}
   .pb-controls{display:flex;align-items:center;gap:16px}
   .pb-controls .btn{background:none;border:none;color:var(--text);cursor:pointer;width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center}
@@ -275,6 +276,7 @@
       <div class="tx">
         <div class="t" id="pbTitle">—</div>
         <div class="a" id="pbArtist">—</div>
+        <div class="q" id="pbQuality"></div>
       </div>
     </div>
     <div class="pb-center">
@@ -413,6 +415,10 @@ function el(tag,props={},...kids){
 /* ============================ Subsonic / Navidrome client ============================ */
 const API_VERSION='1.16.1';
 const IS_TAURI=!!(window.__TAURI__&&window.__TAURI__.core);
+// The desktop build decodes and mixes in Rust (Symphonia + cpal); the browser
+// build keeps using <audio> + Web Audio. `Player` hides which one is active.
+const NATIVE=IS_TAURI;
+const invoke=IS_TAURI?window.__TAURI__.core.invoke:null;
 // In the desktop app, server streams are pulled through the Rust `hpaudio`
 // protocol. That makes them same-origin, which is what lets the equalizer and
 // the spectrum analyser work on them; in a browser they stay direct.
@@ -487,6 +493,8 @@ function makeServerTrack(server, song){
       const raw=Sub.streamUrl(server,this.id);
       return (IS_TAURI&&!this._noProxy)?proxyStreamUrl(raw):raw;
     },
+    // The native engine fetches over HTTP itself, so it wants the plain URL.
+    nativePath(){return Sub.streamUrl(server,this.id);},
     usesEqPath(){return IS_TAURI&&!this._noProxy;},
     getCover(size){return Sub.coverUrl(server,this.coverId,size);}
   };
@@ -494,8 +502,15 @@ function makeServerTrack(server, song){
 function makeLocalTrack(t){
   return {
     source:'local', title:t.title, artist:t.artist||'', album:t.album||'',
-    duration:t.duration||0, cover:t.picture?picToDataUrl(t.picture):null, src:t.src,
-    getStream(){return this.src;}, getCover(){return this.cover;}, usesEqPath(){return true;}
+    duration:t.duration||0,
+    // Native probing hands back a ready data URL; the browser path decodes the
+    // picture block itself.
+    cover:t.cover||(t.picture?picToDataUrl(t.picture):null),
+    src:t.src, path:t.path||null,
+    quality:t.quality||'',
+    getStream(){return this.src;},
+    nativePath(){return this.path;},
+    getCover(){return this.cover;}, usesEqPath(){return true;}
   };
 }
 
@@ -577,19 +592,59 @@ function renderLocal(){
   setViewTitle('Local Files');
   content.innerHTML='';
   const wrap=el('div');
-  const add=el('label',{class:'btn-ghost',style:'display:inline-flex;align-items:center;gap:8px;margin-bottom:18px;cursor:pointer'},
-    el('svg',{viewBox:'0 0 24 24',width:'16',height:'16',html:'<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" fill="currentColor"/>'}),
-    'Add audio files',
-    el('input',{type:'file',accept:'audio/*,.mp3,.flac,.wav,.ogg,.oga,.opus,.m4a,.aac,.mp4,.webm,.mka',multiple:'true',style:'display:none',onchange:onLocalFiles})
-  );
+  const plus='<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" fill="currentColor"/>';
+  const add=NATIVE
+    ? (()=>{const b=el('button',{class:'btn-ghost',style:'display:inline-flex;align-items:center;gap:8px;margin-bottom:18px;cursor:pointer'},
+        el('svg',{viewBox:'0 0 24 24',width:'16',height:'16',html:plus}),'Add audio files');
+        b.addEventListener('click',addFilesNative);return b;})()
+    : el('label',{class:'btn-ghost',style:'display:inline-flex;align-items:center;gap:8px;margin-bottom:18px;cursor:pointer'},
+        el('svg',{viewBox:'0 0 24 24',width:'16',height:'16',html:plus}),
+        'Add audio files',
+        el('input',{type:'file',accept:'audio/*,.mp3,.flac,.wav,.ogg,.oga,.opus,.m4a,.aac,.mp4,.webm,.mka',multiple:'true',style:'display:none',onchange:onLocalFiles})
+      );
   wrap.appendChild(add);
   if(localTracks.length===0){
-    wrap.appendChild(el('div',{class:'empty'},'No local files yet. Add MP3, FLAC, WAV, OGG/Opus, M4A/AAC or WebM audio. Metadata is read automatically.'));
+    wrap.appendChild(el('div',{class:'empty'},NATIVE
+      ? 'No local files yet. Add FLAC, ALAC, WAV, AIFF, MP3, AAC, OGG/Opus and more — decoded natively, lossless formats bit-perfect.'
+      : 'No local files yet. Add MP3, FLAC, WAV, OGG/Opus, M4A/AAC or WebM audio. Metadata is read automatically.'));
   }else{
-    wrap.appendChild(songList(localTracks.map(makeLocalTrack),0));
+    wrap.appendChild(songList(localTracks.map(makeLocalTrack),0,{showQuality:NATIVE}));
   }
   content.appendChild(wrap);
 }
+/* Native file picking: paths go to Rust, which reads tags and cover art with
+   the same decoder that will play the file. */
+const NATIVE_EXTS=['flac','alac','wav','wave','aiff','aif','aifc','caf','m4a','mp4','m4b',
+  'mp3','aac','ogg','oga','opus','mka','mkv','webm','adpcm'];
+async function addFilesNative(){
+  try{
+    const dlg=window.__TAURI__.dialog;
+    const sel=await dlg.open({
+      multiple:true,
+      filters:[{name:'Audio',extensions:NATIVE_EXTS}]
+    });
+    if(!sel)return;
+    const paths=(Array.isArray(sel)?sel:[sel]).map(s=>typeof s==='string'?s:(s&&s.path)).filter(Boolean);
+    const fresh=paths.filter(p=>!localTracks.some(t=>t.path===p));
+    const dupes=paths.length-fresh.length;
+    if(!fresh.length){if(dupes)toast('Already in the library');return;}
+    const infos=await invoke('audio_probe',{paths:fresh});
+    infos.forEach(i=>{
+      localTracks.push({
+        title:i.title||'Unknown', artist:i.artist||'', album:i.album||'',
+        duration:(i.duration||0)*1000, cover:i.cover||null, path:i.path,
+        quality:i.codec?(i.codec+(i.bit_depth?' · '+i.bit_depth+'-bit':'')+
+          (i.sample_rate?' · '+(Math.round(i.sample_rate/100)/10)+' kHz':'')+
+          (i.lossless?' · lossless':'')):''
+      });
+    });
+    const failed=fresh.length-infos.length;
+    if(failed)toast(failed+' file'+(failed>1?'s':'')+' could not be read');
+    else if(dupes)toast(dupes+' duplicate'+(dupes>1?'s':'')+' skipped');
+    renderLocal();
+  }catch(e){nativeFail(e);}
+}
+
 function onLocalFiles(e){
   let skipped=0;
   [...e.target.files].forEach(f=>{
@@ -1011,12 +1066,12 @@ function renderAlbumDetail(server,id){
 }
 
 /* ---------- Generic song list ---------- */
-function songList(tracks,start,{showAlbum=false}={}){
+function songList(tracks,start,{showAlbum=false,showQuality=false}={}){
   const wrap=el('div',{class:'list'});
   const head=el('div',{class:'row head'},
     el('div',{class:'num'},'#'),
     el('div',{},'Title'),
-    showAlbum?el('div',{},'Album'):el('div',{},'Artist'),
+    el('div',{},showQuality?'Format':showAlbum?'Album':'Artist'),
     el('div',{class:'dur'},'')
   );
   wrap.appendChild(head);
@@ -1025,7 +1080,8 @@ function songList(tracks,start,{showAlbum=false}={}){
     const row=el('div',{class:'row'+(i===currentIndex?' playing':'')},
       el('div',{class:'num'},String(i+1+start)),
       el('div',{class:'title'},tk.title),
-      showAlbum?el('div',{class:'sub'},(tk.album||'')):el('div',{class:'sub'},(tk.artist||'')),
+      showQuality&&tk.quality?el('div',{class:'sub'},tk.quality)
+        :showAlbum?el('div',{class:'sub'},(tk.album||'')):el('div',{class:'sub'},(tk.artist||'')),
       el('div',{class:'dur'},dur)
     );
     const mini=el('div',{class:'mini',html:'<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>'});
@@ -1067,6 +1123,7 @@ const Engine={
   ctx:null,src:null,preamp:null,filters:[],analyser:null,
   settings:{enabled:true,preamp:0,gains:[0,0,0,0,0,0,0,0,0,0],preset:'Flat'},
   ensure(){
+    if(NATIVE)return false; // no Web Audio graph in the desktop build
     if(this.ctx)return true;
     const AC=window.AudioContext||window.webkitAudioContext;
     if(!AC)return false;
@@ -1093,8 +1150,15 @@ const Engine={
       return true;
     }catch(e){console.warn('audio engine',e);this.ctx=null;this.analyser=null;return false;}
   },
-  resume(){if(this.ensure()&&this.ctx.state==='suspended')this.ctx.resume();},
+  resume(){if(!NATIVE&&this.ensure()&&this.ctx.state==='suspended')this.ctx.resume();},
   apply(){
+    if(NATIVE){
+      const s=this.settings;
+      invoke('audio_set_eq',{
+        gains:s.gains.slice(),preamp:s.preamp||0,enabled:s.enabled!==false
+      }).catch(nativeFail);
+      return;
+    }
     if(!this.ctx)return;
     const s=this.settings,on=s.enabled!==false;
     this.preamp.gain.value=on?Math.pow(10,(s.preamp||0)/20):1;
@@ -1111,6 +1175,146 @@ const Engine={
   }
 };
 
+/* ============================ Playback facade ============================ */
+// One surface over two engines: native Rust decoding in the desktop app, the
+// dual <audio> elements in a browser. Everything below talks to `Player`.
+const Player={
+  _pos:0,_dur:0,_playing:false,
+  get currentTime(){return NATIVE?this._pos:activeAudio.currentTime;},
+  get duration(){return NATIVE?this._dur:activeAudio.duration;},
+  get paused(){return NATIVE?!this._playing:activeAudio.paused;},
+  seek(t){
+    const target=Math.max(0,t);
+    if(NATIVE){this._pos=target;invoke('audio_seek',{position:target}).catch(nativeFail);}
+    else activeAudio.currentTime=target;
+  },
+  play(){
+    if(NATIVE)invoke('audio_play').catch(nativeFail);
+    else activeAudio.play().catch(()=>{});
+  },
+  pause(){
+    if(NATIVE)invoke('audio_pause').catch(nativeFail);
+    else activeAudio.pause();
+  },
+  setVolume(v){
+    if(NATIVE)invoke('audio_set_volume',{volume:v}).catch(nativeFail);
+    else [audioMain,audioLocalEl].forEach(a=>{a.volume=v*v;a.muted=v===0;});
+  }
+};
+function nativeFail(e){console.warn('audio engine',e);toast(String(e));}
+
+/* Native transport -------------------------------------------------------- */
+// Maps engine track ids back to queue positions, so gapless hand-offs decided
+// in Rust still move the UI to the right row.
+const nativeIds=new Map();
+let nativeLastTrack=0;
+
+function nextIndexFor(auto){
+  if(!queue.length)return null;
+  if(auto&&repeat==='one')return currentIndex;
+  const ord=orderOf();
+  const pos=ord.indexOf(currentIndex);
+  const next=pos+1;
+  if(next<ord.length)return ord[next];
+  return (!auto||repeat==='all')?ord[0]:null;
+}
+
+function nativeQueueNext(){
+  if(!NATIVE)return;
+  const ni=nextIndexFor(true);
+  const path=(ni!=null&&queue[ni])?queue[ni].nativePath():null;
+  invoke('audio_set_next',{path}).then(id=>{
+    if(id&&ni!=null)nativeIds.set(id,ni);
+  }).catch(nativeFail);
+}
+
+function nativePlay(i){
+  const tk=queue[i];
+  const path=tk.nativePath&&tk.nativePath();
+  if(!path){toast('Cannot play this track natively');return;}
+  invoke('audio_load',{path,autoplay:true}).then(id=>{
+    nativeIds.set(id,i);
+    nativeLastTrack=id;
+    nativeQueueNext();
+  }).catch(e=>{
+    nativeFail(e);
+    setTimeout(()=>advance(true),400); // skip what the engine cannot open
+  });
+}
+
+function onNativeTick(t){
+  Player._pos=t.position;
+  Player._dur=t.duration;
+  const wasPlaying=Player._playing;
+  Player._playing=t.playing;
+
+  // The engine moved to the queued track on its own (gapless).
+  if(t.track_id&&t.track_id!==nativeLastTrack){
+    nativeLastTrack=t.track_id;
+    const idx=nativeIds.get(t.track_id);
+    if(idx!=null&&idx!==currentIndex){
+      currentIndex=idx;
+      showNowPlaying(queue[idx]);
+      highlightRow();
+      Lyrics.onTrackChange();
+    }
+    nativeQueueNext();
+  }
+
+  if(t.playing!==wasPlaying)reflectPlayState(t.playing);
+
+  if(!seeking){
+    const pct=t.duration?(t.position/t.duration)*100:0;
+    $('fill').style.width=pct+'%';$('knob').style.left=pct+'%';
+    $('curTime').textContent=fmt(t.position);
+    $('durTime').textContent=fmt(t.duration);
+    if(Lyrics.open)Lyrics.sync(t.position);
+  }
+  if(t.bars&&t.bars.length)Viz.setBars(t.bars);
+  setQualityBadge(t);
+
+  if(t.ended&&!Player._endedHandled){
+    Player._endedHandled=true;
+    advance(true);
+  }
+  if(!t.ended)Player._endedHandled=false;
+}
+
+function setQualityBadge(t){
+  const el=$('pbQuality');
+  if(!el)return;
+  if(!t.codec||!t.sample_rate){el.textContent='';return;}
+  const khz=(t.sample_rate/1000);
+  const bits=t.bit_depth?t.bit_depth+'-bit ':'';
+  el.textContent=t.codec+' · '+bits+(Math.round(khz*10)/10)+' kHz';
+}
+
+function reflectPlayState(playing){
+  $('playIcon').innerHTML=playing
+    ?'<path d="M6 5h4v14H6zm8 0h4v14h-4z"/>'
+    :'<path d="M8 5v14l11-7z"/>';
+  $('playerbar').classList.toggle('paused',!playing);
+  if(navigator.mediaSession)navigator.mediaSession.playbackState=playing?'playing':'paused';
+  if(playing)Viz.onPlay();else Viz.onPause();
+}
+
+function showNowPlaying(tk){
+  if(!tk)return;
+  $('pbTitle').textContent=tk.title;
+  $('pbArtist').textContent=tk.artist||'';
+  const cov=tk.getCover(120);
+  const covEl=$('pbCover');covEl.innerHTML='';
+  if(cov)covEl.appendChild(el('img',{src:cov,alt:''}));
+  else covEl.innerHTML='<span style="font-size:24px">♪</span>';
+  if('mediaSession' in navigator&&window.MediaMetadata){
+    try{
+      navigator.mediaSession.metadata=new MediaMetadata({
+        title:tk.title,artist:tk.artist||'',album:tk.album||'',artwork:cov?[{src:cov}]:[]
+      });
+    }catch(e){}
+  }
+}
+
 /* ============================ Player ============================ */
 function orderOf(){
   if(!shuffle)return queue.map((_,i)=>i);
@@ -1126,31 +1330,24 @@ function reshuffleOrder(){
 }
 function playAt(i){
   if(i<0||i>=queue.length)return;
-  Engine.resume();
   currentIndex=i;
   if(shuffle&&playOrder.length!==queue.length)reshuffleOrder();
   const tk=queue[i];
-  const target=(tk.usesEqPath&&tk.usesEqPath())?audioLocalEl:audioMain;
-  if(activeAudio!==target){
-    const old=activeAudio;
-    activeAudio=target; // reassign first so events from the old element are ignored
-    old.pause();old.removeAttribute('src');try{old.load();}catch(e){}
+  showNowPlaying(tk);
+  if(NATIVE){
+    Player._endedHandled=false;
+    nativePlay(i);
+  }else{
+    Engine.resume();
+    const target=(tk.usesEqPath&&tk.usesEqPath())?audioLocalEl:audioMain;
+    if(activeAudio!==target){
+      const old=activeAudio;
+      activeAudio=target; // reassign first so events from the old element are ignored
+      old.pause();old.removeAttribute('src');try{old.load();}catch(e){}
+    }
+    activeAudio.src=tk.getStream();
+    activeAudio.play().catch(()=>{});
   }
-  activeAudio.src=tk.getStream();
-  $('pbTitle').textContent=tk.title;
-  $('pbArtist').textContent=tk.artist||'';
-  const cov=tk.getCover(120);
-  const covEl=$('pbCover');covEl.innerHTML='';
-  if(cov)covEl.appendChild(el('img',{src:cov,alt:''}));
-  else covEl.innerHTML='<span style="font-size:24px">♪</span>';
-  if('mediaSession' in navigator&&window.MediaMetadata){
-    try{
-      navigator.mediaSession.metadata=new MediaMetadata({
-        title:tk.title,artist:tk.artist||'',album:tk.album||'',artwork:cov?[{src:cov}]:[]
-      });
-    }catch(e){}
-  }
-  activeAudio.play().catch(()=>{});
   highlightRow();
   Lyrics.onTrackChange();
 }
@@ -1158,30 +1355,29 @@ function highlightRow(){
   [...content.querySelectorAll('.row:not(.head)')].forEach((r,i)=>r.classList.toggle('playing',i===currentIndex));
 }
 function togglePlay(){
-  Engine.resume();
   if(currentIndex<0){if(queue.length)return playAt(0);else return;}
-  if(activeAudio.paused)activeAudio.play().catch(()=>{});else activeAudio.pause();
+  if(!NATIVE)Engine.resume();
+  if(Player.paused)Player.play();else Player.pause();
 }
 function advance(auto){
   if(!queue.length)return;
-  if(auto&&repeat==='one'){activeAudio.currentTime=0;activeAudio.play().catch(()=>{});return;}
-  const ord=orderOf();
-  const pos=ord.indexOf(currentIndex);
-  let next=pos+1;
-  if(next>=ord.length){
-    if(auto&&repeat!=='all')return; // end of queue, no repeat — stop
-    next=0;
-  }
-  playAt(ord[next]);
+  if(auto&&repeat==='one'){Player.seek(0);Player.play();return;}
+  const next=nextIndexFor(auto);
+  if(next==null)return; // end of queue, no repeat — stop
+  playAt(next);
 }
 function nextTrack(){advance(false);}
 function prevTrack(){
-  if(activeAudio.currentTime>3){activeAudio.currentTime=0;return;}
+  if(Player.currentTime>3){Player.seek(0);return;}
   const ord=orderOf();
   const pos=ord.indexOf(currentIndex);
   playAt(pos>0?ord[pos-1]:(currentIndex>=0?currentIndex:0));
 }
-function setShuffle(v){shuffle=v;if(v)reshuffleOrder();updateModeButtons();saveSettings();}
+function setShuffle(v){
+  shuffle=v;if(v)reshuffleOrder();
+  updateModeButtons();saveSettings();
+  nativeQueueNext(); // order changed → re-arm the gapless hand-off
+}
 function updateModeButtons(){
   $('shuffleBtn').classList.toggle('on',shuffle);
   $('repeatBtn').classList.toggle('on',repeat!=='off');
@@ -1210,6 +1406,7 @@ function loadSettings(){
 }
 
 function wireAudio(a){
+  if(NATIVE)return; // the Rust engine drives the UI through audio:tick
   a.addEventListener('play',()=>{
     if(a!==activeAudio)return;
     $('playIcon').innerHTML='<path d="M6 5h4v14H6zm8 0h4v14h-4z"/>';
@@ -1295,8 +1492,15 @@ const Viz={
     this.canvas.width=Math.max(2,Math.floor(r.width*dpr));
     this.canvas.height=Math.max(2,Math.floor(r.height*dpr));
   },
+  // Native mode: bars are computed by the FFT in Rust and pushed in here.
+  setBars(bytes){
+    if(!this._smooth)this._smooth=new Float32Array(this.bars);
+    const n=Math.min(bytes.length,this.bars);
+    for(let i=0;i<n;i++)this._smooth[i]=bytes[i]/255;
+    this._nativeAt=performance.now();
+  },
   onPlay(){
-    if(Engine.ctx&&Engine.ctx.state==='suspended')Engine.ctx.resume();
+    if(!NATIVE&&Engine.ctx&&Engine.ctx.state==='suspended')Engine.ctx.resume();
     this._paused=false;
     this.kick();
   },
@@ -1308,6 +1512,16 @@ const Viz={
       if(!this.enabled){this._running=false;this.raf=0;return;}
       this._lastFrame=performance.now();
       this.raf=requestAnimationFrame(step);
+      if(NATIVE){
+        // Values arrive with the tick event; just decay if they stop coming.
+        if(this._paused||performance.now()-(this._nativeAt||0)>200){
+          const t=performance.now()*0.001;
+          for(let i=0;i<this.bars;i++)
+            this._smooth[i]=Math.max(this._smooth[i]*0.9,0.04+0.03*Math.sin(t*1.5+i*0.4));
+        }
+        this.draw();
+        return;
+      }
       const an=Engine.analyser;
       const live=!this._paused&&an&&activeAudio!==audioMain;
       if(live){
@@ -1370,9 +1584,11 @@ $('vizToggle').addEventListener('click',()=>Viz.toggle());
 function seekFromEvent(e){
   const rect=$('progress').getBoundingClientRect();
   const ratio=Math.min(1,Math.max(0,(e.clientX-rect.left)/rect.width));
-  if(activeAudio.duration){
-    activeAudio.currentTime=ratio*activeAudio.duration;
+  const dur=Player.duration;
+  if(dur&&isFinite(dur)){
+    Player.seek(ratio*dur);
     $('fill').style.width=(ratio*100)+'%';$('knob').style.left=(ratio*100)+'%';
+    $('curTime').textContent=fmt(ratio*dur);
   }
 }
 const progressEl=$('progress');
@@ -1384,7 +1600,7 @@ progressEl.addEventListener('pointercancel',()=>seeking=false);
 // volume (perceptual curve — v² feels linear to the ear)
 function applyVolume(){
   const v=parseFloat($('volume').value);
-  [audioMain,audioLocalEl].forEach(a=>{a.volume=v*v;a.muted=v===0;});
+  Player.setVolume(v*v); // squared curve — closer to how loudness is perceived
   saveSettings();
   $('volIcon').innerHTML=v===0
     ? '<path d="M3 9v6h4l5 5V4L7 9H3zm13 3l3 3 1.4-1.4L17.4 12l3-3L19 7.6l-3 3-3-3L11.6 9l3 3-3 3L13 18.4l3-3 3 3 1.4-1.4z"/>'
@@ -1406,16 +1622,16 @@ $('repeatBtn').addEventListener('click',()=>{
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT')return;
   if(e.code==='Space'){e.preventDefault();togglePlay();}
-  else if(e.code==='ArrowRight')activeAudio.currentTime=Math.min(activeAudio.duration||0,activeAudio.currentTime+5);
-  else if(e.code==='ArrowLeft')activeAudio.currentTime=Math.max(0,activeAudio.currentTime-5);
+  else if(e.code==='ArrowRight')Player.seek(Math.min(Player.duration||0,Player.currentTime+5));
+  else if(e.code==='ArrowLeft')Player.seek(Math.max(0,Player.currentTime-5));
   else if(e.code==='ArrowUp'){$('volume').value=Math.min(1,parseFloat($('volume').value)+0.05);applyVolume();}
   else if(e.code==='ArrowDown'){$('volume').value=Math.max(0,parseFloat($('volume').value)-0.05);applyVolume();}
 });
 
 // media session
 if(navigator.mediaSession){
-  navigator.mediaSession.setActionHandler('play',()=>activeAudio.play());
-  navigator.mediaSession.setActionHandler('pause',()=>activeAudio.pause());
+  navigator.mediaSession.setActionHandler('play',()=>Player.play());
+  navigator.mediaSession.setActionHandler('pause',()=>Player.pause());
   navigator.mediaSession.setActionHandler('nexttrack',nextTrack);
   navigator.mediaSession.setActionHandler('previoustrack',prevTrack);
 }
@@ -1682,6 +1898,11 @@ applyVolume();
 Viz.init();
 buildEqUI();
 updateModeButtons();
+if(NATIVE){
+  // Rust drives transport state, spectrum and progress through one event.
+  window.__TAURI__.event.listen('audio:tick',e=>{try{onNativeTick(e.payload);}catch(err){console.warn(err);}});
+  Engine.apply(); // push stored EQ settings into the engine
+}
 // Build/resume the Web Audio graph on the very first user gesture (autoplay-policy safe).
 function _firstGesture(){Engine.resume();window.removeEventListener('pointerdown',_firstGesture);window.removeEventListener('keydown',_firstGesture);}
 window.addEventListener('pointerdown',_firstGesture);

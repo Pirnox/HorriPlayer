@@ -23,7 +23,13 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "blocking"] }
+symphonia = { version = "0.5.5", features = ["aac", "alac", "flac", "isomp4", "mp3", "pcm", "vorbis", "ogg", "wav", "aiff", "caf", "adpcm", "mkv"] }
+cpal = "0.17.1"
+rtrb = "0.3.4"
+rubato = "0.16"
+realfft = "3.5.0"
+tauri-plugin-dialog = "2.7.2"
 
 [profile.release]
 lto = true
