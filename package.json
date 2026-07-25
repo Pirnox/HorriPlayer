@@ -1,0 +1,15 @@
+{
+  "name": "horriplayer",
+  "version": "1.0.0",
+  "description": "HorriPlayer — music player (Tauri)",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
