@@ -1,10 +1,12 @@
 {
   "name": "horriplayer",
-  "version": "1.0.0",
+  "version": "0.1.1",
   "description": "HorriPlayer — music player (Tauri)",
-  "main": "index.js",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
   },
   "keywords": [],
   "author": "",
