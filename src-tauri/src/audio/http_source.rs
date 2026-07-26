@@ -59,10 +59,9 @@ impl HttpSource {
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("HTTP {status} while fetching audio"),
-            ));
+            return Err(io::Error::other(format!(
+                "HTTP {status} while fetching audio"
+            )));
         }
 
         // 206 means the range was honoured; 200 means we got the entire file.
@@ -99,7 +98,7 @@ impl HttpSource {
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 impl Read for HttpSource {

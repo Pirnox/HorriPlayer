@@ -119,7 +119,7 @@ fn visual_to_data_url(v: &Visual) -> Option<String> {
 
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b = [
             chunk[0],
@@ -190,7 +190,8 @@ mod tests {
         f.write_all(&hdr).expect("write header");
         let mut body = Vec::with_capacity(data_len as usize);
         for i in 0..frames {
-            let v = ((i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 12000.0) as i16;
+            let v =
+                ((i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 12000.0) as i16;
             body.extend(&v.to_le_bytes());
             body.extend(&v.to_le_bytes());
         }

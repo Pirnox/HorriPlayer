@@ -335,7 +335,12 @@ impl AudioEngine {
             ended: self.shared.ended.load(Ordering::Relaxed),
             sample_rate: self.shared.src_rate.load(Ordering::Relaxed),
             bit_depth: self.shared.src_bits.load(Ordering::Relaxed),
-            codec: self.shared.codec.lock().map(|c| c.clone()).unwrap_or_default(),
+            codec: self
+                .shared
+                .codec
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_default(),
             error: self.shared.last_error.lock().ok().and_then(|e| e.clone()),
         }
     }
@@ -343,12 +348,156 @@ impl AudioEngine {
 
 /* ------------------------------- output ------------------------------- */
 
+/// Everything the output callback needs, kept out of the closure so the same
+/// logic can serve every sample format the host might ask for — and be tested
+/// without an audio device.
+struct Mixer {
+    audio_rx: rtrb::Consumer<f32>,
+    marker_rx: rtrb::Consumer<TrackMarker>,
+    fft_tx: rtrb::Producer<f32>,
+    shared: Arc<Shared>,
+    equalizer: Equalizer,
+    channels: usize,
+    eq_seen: u64,
+    flush_seen: u64,
+    origin_global: u64,
+    origin_pos: u64,
+    pending: Option<TrackMarker>,
+}
+
+impl Mixer {
+    /// Fill one buffer of interleaved f32 frames. Allocation-free and
+    /// non-blocking: an empty ring simply yields silence.
+    fn fill(&mut self, out: &mut [f32]) {
+        let sh = Arc::clone(&self.shared);
+        let version = sh.eq_version.load(Ordering::Acquire);
+        if version != self.eq_seen {
+            let (gains, preamp, enabled) = sh.eq_params();
+            self.equalizer.set_params(&gains, preamp, enabled);
+            self.eq_seen = version;
+        }
+
+        // A seek or track load invalidates everything still queued.
+        let flush = sh.flush_version.load(Ordering::Acquire);
+        if flush != self.flush_seen {
+            let stale = self.audio_rx.slots();
+            if stale > 0 {
+                if let Ok(chunk) = self.audio_rx.read_chunk(stale) {
+                    chunk.commit_all();
+                }
+            }
+            self.equalizer.reset(); // filter memory belongs to the old audio
+            self.flush_seen = flush;
+        }
+
+        let channels = self.channels;
+        let mut filled = 0usize;
+        if sh.playing.load(Ordering::Relaxed) {
+            let want = out.len().min(self.audio_rx.slots());
+            if want >= channels {
+                if let Ok(chunk) = self.audio_rx.read_chunk(want) {
+                    let (a, b) = chunk.as_slices();
+                    let usable = ((a.len() + b.len()) / channels) * channels; // whole frames only
+                    let from_a = a.len().min(usable);
+                    out[..from_a].copy_from_slice(&a[..from_a]);
+                    if usable > from_a {
+                        out[from_a..usable].copy_from_slice(&b[..usable - from_a]);
+                    }
+                    filled = usable;
+                    chunk.commit(usable);
+                }
+            }
+        }
+        // Underrun or paused: silence the remainder.
+        out[filled..].fill(0.0);
+
+        let frames_out = filled / channels;
+        if frames_out == 0 {
+            return;
+        }
+
+        self.equalizer
+            .process_interleaved(&mut out[..filled], channels);
+        let vol = sh.volume();
+        if (vol - 1.0).abs() > f32::EPSILON {
+            for s in out[..filled].iter_mut() {
+                *s *= vol;
+            }
+        }
+
+        let played = sh
+            .played_frames
+            .fetch_add(frames_out as u64, Ordering::Relaxed)
+            + frames_out as u64;
+
+        // Advance across any track boundary we just crossed.
+        loop {
+            if self.pending.is_none() {
+                self.pending = self.marker_rx.pop().ok();
+            }
+            match self.pending {
+                Some(m) if played >= m.at_global_frame => {
+                    self.origin_global = m.at_global_frame;
+                    self.origin_pos = m.track_start_frame;
+                    sh.current_track.store(m.track_id, Ordering::Relaxed);
+                    self.pending = None;
+                }
+                _ => break,
+            }
+        }
+        sh.pos_frames.store(
+            self.origin_pos + played.saturating_sub(self.origin_global),
+            Ordering::Relaxed,
+        );
+
+        // Mono mix for the spectrum; dropping samples when the analyser is
+        // behind is fine, it only needs recent audio.
+        for frame in out[..filled].chunks(channels) {
+            let mono = frame.iter().sum::<f32>() / channels as f32;
+            let _ = self.fft_tx.push(mono);
+        }
+    }
+}
+
+/// Build the stream for a concrete sample type. Hosts differ: WASAPI hands out
+/// f32, while ALSA and PulseAudio commonly want i16 — assuming f32 everywhere
+/// makes cpal panic on those hosts.
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut mixer: Mixer,
+    shared: Arc<Shared>,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let mut scratch: Vec<f32> = Vec::new();
+    device.build_output_stream(
+        config,
+        move |out: &mut [T], _| {
+            if scratch.len() != out.len() {
+                scratch.resize(out.len(), 0.0);
+            }
+            mixer.fill(&mut scratch);
+            for (dst, src) in out.iter_mut().zip(scratch.iter()) {
+                *dst = T::from_sample(*src);
+            }
+        },
+        move |err| {
+            if let Ok(mut slot) = shared.last_error.lock() {
+                *slot = Some(format!("audio output error: {err}"));
+            }
+        },
+        None,
+    )
+}
+
 fn spawn_output_thread(
     device: cpal::Device,
     config: cpal::SupportedStreamConfig,
-    mut audio_rx: rtrb::Consumer<f32>,
-    mut marker_rx: rtrb::Consumer<TrackMarker>,
-    mut fft_tx: rtrb::Producer<f32>,
+    audio_rx: rtrb::Consumer<f32>,
+    marker_rx: rtrb::Consumer<TrackMarker>,
+    fft_tx: rtrb::Producer<f32>,
     shared: Arc<Shared>,
 ) {
     std::thread::Builder::new()
@@ -356,108 +505,47 @@ fn spawn_output_thread(
         .spawn(move || {
             let channels = config.channels() as usize;
             let rate = config.sample_rate();
-            let mut equalizer = Equalizer::new(rate, channels);
-            let mut eq_seen = u64::MAX;
-            let mut flush_seen = 0u64;
-            // Position bookkeeping resolved from track markers.
-            let mut origin_global: u64 = 0; // global frame where the current segment began
-            let mut origin_pos: u64 = 0; // position inside the track at that point
-            let mut pending: Option<TrackMarker> = None;
+            let mixer = Mixer {
+                audio_rx,
+                marker_rx,
+                fft_tx,
+                shared: Arc::clone(&shared),
+                equalizer: Equalizer::new(rate, channels),
+                channels,
+                eq_seen: u64::MAX,
+                flush_seen: 0,
+                origin_global: 0,
+                origin_pos: 0,
+                pending: None,
+            };
 
-            let stream_shared = Arc::clone(&shared);
-            let err_shared = Arc::clone(&shared);
-            let stream = device.build_output_stream(
-                &config.config(),
-                move |out: &mut [f32], _| {
-                    let sh = &stream_shared;
-                    let version = sh.eq_version.load(Ordering::Acquire);
-                    if version != eq_seen {
-                        let (gains, preamp, enabled) = sh.eq_params();
-                        equalizer.set_params(&gains, preamp, enabled);
-                        eq_seen = version;
+            let cfg = config.config();
+            let stream = match config.sample_format() {
+                cpal::SampleFormat::F32 => {
+                    build_stream::<f32>(&device, &cfg, mixer, Arc::clone(&shared))
+                }
+                cpal::SampleFormat::I16 => {
+                    build_stream::<i16>(&device, &cfg, mixer, Arc::clone(&shared))
+                }
+                cpal::SampleFormat::U16 => {
+                    build_stream::<u16>(&device, &cfg, mixer, Arc::clone(&shared))
+                }
+                cpal::SampleFormat::I32 => {
+                    build_stream::<i32>(&device, &cfg, mixer, Arc::clone(&shared))
+                }
+                cpal::SampleFormat::U8 => {
+                    build_stream::<u8>(&device, &cfg, mixer, Arc::clone(&shared))
+                }
+                cpal::SampleFormat::F64 => {
+                    build_stream::<f64>(&device, &cfg, mixer, Arc::clone(&shared))
+                }
+                other => {
+                    if let Ok(mut slot) = shared.last_error.lock() {
+                        *slot = Some(format!("unsupported audio sample format: {other:?}"));
                     }
-
-                    // A seek or track load invalidates everything still queued.
-                    let flush = sh.flush_version.load(Ordering::Acquire);
-                    if flush != flush_seen {
-                        let stale = audio_rx.slots();
-                        if stale > 0 {
-                            if let Ok(chunk) = audio_rx.read_chunk(stale) {
-                                chunk.commit_all();
-                            }
-                        }
-                        equalizer.reset(); // filter memory belongs to the old audio
-                        flush_seen = flush;
-                    }
-
-                    let frames_wanted = out.len() / channels;
-                    let mut filled = 0usize;
-                    if sh.playing.load(Ordering::Relaxed) {
-                        if let Ok(chunk) = audio_rx.read_chunk(out.len().min(audio_rx.slots())) {
-                            let (a, b) = chunk.as_slices();
-                            let n = a.len() + b.len();
-                            let usable = (n / channels) * channels; // whole frames only
-                            out[..a.len().min(usable)]
-                                .copy_from_slice(&a[..a.len().min(usable)]);
-                            if usable > a.len() {
-                                out[a.len()..usable].copy_from_slice(&b[..usable - a.len()]);
-                            }
-                            filled = usable;
-                            chunk.commit(usable);
-                        }
-                    }
-                    // Underrun or paused: silence the remainder.
-                    out[filled..].fill(0.0);
-
-                    let frames_out = filled / channels;
-                    if frames_out > 0 {
-                        equalizer.process_interleaved(&mut out[..filled], channels);
-                        let vol = sh.volume();
-                        if (vol - 1.0).abs() > f32::EPSILON {
-                            for s in out[..filled].iter_mut() {
-                                *s *= vol;
-                            }
-                        }
-
-                        let played = sh.played_frames.fetch_add(frames_out as u64, Ordering::Relaxed)
-                            + frames_out as u64;
-
-                        // Advance across any track boundary we just crossed.
-                        loop {
-                            if pending.is_none() {
-                                pending = marker_rx.pop().ok();
-                            }
-                            match pending {
-                                Some(m) if played >= m.at_global_frame => {
-                                    origin_global = m.at_global_frame;
-                                    origin_pos = m.track_start_frame;
-                                    sh.current_track.store(m.track_id, Ordering::Relaxed);
-                                    pending = None;
-                                }
-                                _ => break,
-                            }
-                        }
-                        sh.pos_frames.store(
-                            origin_pos + played.saturating_sub(origin_global),
-                            Ordering::Relaxed,
-                        );
-
-                        // Mono mix for the spectrum; dropping samples when the
-                        // analyser is behind is fine, it only needs recent audio.
-                        for frame in out[..filled].chunks(channels) {
-                            let mono = frame.iter().sum::<f32>() / channels as f32;
-                            let _ = fft_tx.push(mono);
-                        }
-                    }
-                    let _ = frames_wanted;
-                },
-                move |err| {
-                    if let Ok(mut slot) = err_shared.last_error.lock() {
-                        *slot = Some(format!("audio output error: {err}"));
-                    }
-                },
-                None,
-            );
+                    return;
+                }
+            };
 
             let stream = match stream {
                 Ok(s) => s,
@@ -745,9 +833,10 @@ fn write_frame(out: &mut Vec<f32>, frame: &[f32], out_channels: usize) {
             for ch in 0..n {
                 // Duplicate the last available channel rather than dropping to
                 // silence when the file has fewer channels than the device.
-                let v = frame.get(ch).copied().unwrap_or_else(|| {
-                    frame.get(frame.len() - 1).copied().unwrap_or(0.0)
-                });
+                let v = frame
+                    .get(ch)
+                    .copied()
+                    .unwrap_or_else(|| frame.last().copied().unwrap_or(0.0));
                 out.push(v);
             }
         }
@@ -828,8 +917,8 @@ fn open_source(
             MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default())
         }
         Source::Url(url) => {
-            let src = HttpSource::new(url.clone())
-                .map_err(|e| format!("cannot open stream: {e}"))?;
+            let src =
+                HttpSource::new(url.clone()).map_err(|e| format!("cannot open stream: {e}"))?;
             MediaSourceStream::new(Box::new(src), MediaSourceStreamOptions::default())
         }
     };
@@ -1038,7 +1127,10 @@ fn spawn_monitor_thread(app: AppHandle, mut fft_rx: rtrb::Consumer<f32>, shared:
                     duration: shared.duration_ms.load(Ordering::Relaxed) as f64 / 1000.0,
                     track_id: track,
                     ended,
-                    bars: bars.iter().map(|v| (v * 255.0).clamp(0.0, 255.0) as u8).collect(),
+                    bars: bars
+                        .iter()
+                        .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
+                        .collect(),
                     sample_rate: shared.src_rate.load(Ordering::Relaxed),
                     bit_depth: shared.src_bits.load(Ordering::Relaxed),
                     codec: shared.codec.lock().map(|c| c.clone()).unwrap_or_default(),
@@ -1063,17 +1155,16 @@ fn bucket_spectrum(
     smooth: &mut [f32; SPECTRUM_BARS],
 ) -> [f32; SPECTRUM_BARS] {
     let n = bins.len();
-    for i in 0..SPECTRUM_BARS {
+    for (i, slot) in smooth.iter_mut().enumerate() {
         let lo = ((i as f32 / SPECTRUM_BARS as f32).powf(1.4) * n as f32) as usize;
         let hi = (((i + 1) as f32 / SPECTRUM_BARS as f32).powf(1.4) * n as f32) as usize;
         let hi = hi.max(lo + 1).min(n);
-        let mut peak = 0.0f32;
-        for bin in &bins[lo.min(n.saturating_sub(1))..hi] {
-            peak = peak.max(bin.norm());
-        }
+        let peak = bins[lo.min(n.saturating_sub(1))..hi]
+            .iter()
+            .fold(0.0f32, |acc, bin| acc.max(bin.norm()));
         // Normalise and shape to roughly match the old byte-frequency curve.
         let v = (peak / (FFT_SIZE as f32 * 0.25)).sqrt().clamp(0.0, 1.0);
-        smooth[i] = smooth[i] * 0.72 + v * 0.28;
+        *slot = *slot * 0.72 + v * 0.28;
     }
     *smooth
 }
@@ -1120,6 +1211,166 @@ mod tests {
         let mut out = Vec::new();
         write_frame(&mut out, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2);
         assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    /// Build a Mixer wired to rings we control, with no audio device involved.
+    fn test_mixer(
+        channels: usize,
+    ) -> (
+        Mixer,
+        rtrb::Producer<f32>,
+        rtrb::Producer<TrackMarker>,
+        Arc<Shared>,
+    ) {
+        let (audio_tx, audio_rx) = rtrb::RingBuffer::<f32>::new(4096);
+        let (marker_tx, marker_rx) = rtrb::RingBuffer::<TrackMarker>::new(16);
+        let (fft_tx, _fft_rx) = rtrb::RingBuffer::<f32>::new(4096);
+        let shared = Arc::new(Shared::new());
+        let mixer = Mixer {
+            audio_rx,
+            marker_rx,
+            fft_tx,
+            shared: Arc::clone(&shared),
+            equalizer: Equalizer::new(48_000, channels),
+            channels,
+            eq_seen: u64::MAX,
+            flush_seen: 0,
+            origin_global: 0,
+            origin_pos: 0,
+            pending: None,
+        };
+        (mixer, audio_tx, marker_tx, shared)
+    }
+
+    fn push(tx: &mut rtrb::Producer<f32>, data: &[f32]) {
+        for v in data {
+            tx.push(*v).expect("ring has room");
+        }
+    }
+
+    #[test]
+    fn silence_is_output_when_paused() {
+        let (mut mixer, mut tx, _mk, shared) = test_mixer(2);
+        push(&mut tx, &[0.5; 64]);
+        shared.playing.store(false, Ordering::Relaxed);
+        let mut out = [1.0f32; 64];
+        mixer.fill(&mut out);
+        assert!(
+            out.iter().all(|v| *v == 0.0),
+            "paused output must be silent"
+        );
+        assert_eq!(
+            shared.played_frames.load(Ordering::Relaxed),
+            0,
+            "paused playback must not advance position"
+        );
+    }
+
+    #[test]
+    fn underrun_fills_the_rest_with_silence_instead_of_repeating() {
+        let (mut mixer, mut tx, _mk, shared) = test_mixer(2);
+        shared.playing.store(true, Ordering::Relaxed);
+        push(&mut tx, &[0.25; 8]); // only 4 frames for a 16-frame buffer
+        let mut out = [9.0f32; 32];
+        mixer.fill(&mut out);
+        assert!(out[..8].iter().all(|v| (*v - 0.25).abs() < 1e-6));
+        assert!(
+            out[8..].iter().all(|v| *v == 0.0),
+            "missing audio must become silence, not stale samples"
+        );
+    }
+
+    #[test]
+    fn position_follows_playback_and_track_markers() {
+        let (mut mixer, mut tx, mut mk, shared) = test_mixer(2);
+        shared.playing.store(true, Ordering::Relaxed);
+
+        // First track starts at global frame 0.
+        mk.push(TrackMarker {
+            at_global_frame: 0,
+            track_id: 7,
+            track_start_frame: 0,
+        })
+        .unwrap();
+        push(&mut tx, &[0.1; 64]); // 32 frames
+        let mut out = [0.0f32; 64];
+        mixer.fill(&mut out);
+        assert_eq!(shared.pos_frames.load(Ordering::Relaxed), 32);
+        assert_eq!(shared.current_track.load(Ordering::Relaxed), 7);
+
+        // Gapless hand-off: next track begins at global frame 32.
+        mk.push(TrackMarker {
+            at_global_frame: 32,
+            track_id: 8,
+            track_start_frame: 0,
+        })
+        .unwrap();
+        push(&mut tx, &[0.1; 64]);
+        mixer.fill(&mut out);
+        assert_eq!(shared.current_track.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            shared.pos_frames.load(Ordering::Relaxed),
+            32,
+            "position must restart within the new track, not keep counting"
+        );
+    }
+
+    #[test]
+    fn seek_marker_reports_position_inside_the_track() {
+        let (mut mixer, mut tx, mut mk, shared) = test_mixer(2);
+        shared.playing.store(true, Ordering::Relaxed);
+        // Seeked to frame 1000; playback resumes at global frame 0.
+        mk.push(TrackMarker {
+            at_global_frame: 0,
+            track_id: 3,
+            track_start_frame: 1000,
+        })
+        .unwrap();
+        push(&mut tx, &[0.2; 40]); // 20 frames
+        let mut out = [0.0f32; 40];
+        mixer.fill(&mut out);
+        assert_eq!(shared.pos_frames.load(Ordering::Relaxed), 1020);
+    }
+
+    #[test]
+    fn flush_discards_queued_audio() {
+        let (mut mixer, mut tx, _mk, shared) = test_mixer(2);
+        shared.playing.store(true, Ordering::Relaxed);
+        push(&mut tx, &[0.75; 64]);
+        // A seek happened before this buffer was ever played.
+        shared.flush_version.fetch_add(1, Ordering::Release);
+        let mut out = [0.0f32; 64];
+        mixer.fill(&mut out);
+        assert!(
+            out.iter().all(|v| *v == 0.0),
+            "audio queued before a seek must never reach the device"
+        );
+    }
+
+    #[test]
+    fn volume_scales_the_output() {
+        let (mut mixer, mut tx, _mk, shared) = test_mixer(2);
+        shared.playing.store(true, Ordering::Relaxed);
+        shared
+            .volume_bits
+            .store(0.5f32.to_bits(), Ordering::Relaxed);
+        push(&mut tx, &[1.0; 16]);
+        let mut out = [0.0f32; 16];
+        mixer.fill(&mut out);
+        assert!(out.iter().all(|v| (*v - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn partial_frames_are_never_split_across_buffers() {
+        // 3 samples with 2 channels is one whole frame plus a stray sample; the
+        // stray must stay in the ring so channels don't swap places.
+        let (mut mixer, mut tx, _mk, shared) = test_mixer(2);
+        shared.playing.store(true, Ordering::Relaxed);
+        push(&mut tx, &[1.0, -1.0, 1.0]);
+        let mut out = [0.0f32; 8];
+        mixer.fill(&mut out);
+        assert_eq!(shared.played_frames.load(Ordering::Relaxed), 1);
+        assert_eq!(&out[..2], &[1.0, -1.0]);
     }
 
     #[test]

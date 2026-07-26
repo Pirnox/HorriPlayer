@@ -1,0 +1,107 @@
+name: Release
+
+# Build installers for every platform. Started by hand, and only after CI has
+# passed — the `test` job below is the same one CI runs, so a red test never
+# produces a build. The result lands as a *draft* release for review before
+# anyone can download it.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: test
+    # Optional second gate: define an environment named `release` in the repo
+    # settings with required reviewers, and this job waits for approval.
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+            args: '--bundles nsis'
+          - os: ubuntu-22.04
+            label: Linux
+            args: '--bundles appimage,deb'
+          - os: macos-latest
+            label: macOS (universal)
+            args: '--target universal-apple-darwin --bundles dmg,app'
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            build-essential \
+            patchelf \
+            libfuse2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Universal macOS binaries need both architectures available.
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # Keeps the Tauri build input in step with the source of truth.
+      - name: Sync UI
+        shell: bash
+        run: cp index.html ui/index.html
+
+      - name: Build and attach to draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ inputs.tag }}
+          releaseName: HorriPlayer ${{ inputs.tag }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # A standalone binary for people who already have WebKitGTK installed.
+      - name: Attach bare Linux binary
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bin=src-tauri/target/release/horriplayer
+          out="horriplayer-${{ inputs.tag }}-linux-x86_64"
+          cp "$bin" "$out"
+          gh release upload "${{ inputs.tag }}" "$out" --clobber

@@ -195,7 +195,9 @@ async fn proxy_audio(b64_url: String, range: Option<String>) -> Response<Vec<u8>
     if let Some(cr) = content_range {
         builder = builder.header("Content-Range", cr);
     }
-    builder.body(bytes).unwrap_or_else(|_| bad(500, "response build failed"))
+    builder
+        .body(bytes)
+        .unwrap_or_else(|_| bad(500, "response build failed"))
 }
 
 /// HTTP GET returning the response body as text.
@@ -219,36 +221,11 @@ async fn http_get_text(url: String) -> Result<String, String> {
     Ok(text)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::b64url_decode;
-
-    #[test]
-    fn decodes_base64url_from_the_frontend() {
-        // produced by the UI's btoa(...) encoder for the URL asserted below
-        let encoded = "aHR0cDovLzE5Mi4xNjguMS4xMDo0NTMzL3Jlc3Qvc3RyZWFtP3U9YWRtaW4mdD1hYmMxMjMmcz14eSZ2PTEuMTYuMSZjPWhvcnJpcGxheWVyJmY9anNvbiZpZD10ci00Mn7EhcSZ";
-        let decoded = String::from_utf8(b64url_decode(encoded).expect("decodes")).expect("utf-8");
-        assert_eq!(
-            decoded,
-            "http://192.168.1.10:4533/rest/stream?u=admin&t=abc123&s=xy&v=1.16.1&c=horriplayer&f=json&id=tr-42~ąę"
-        );
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        assert!(b64url_decode("not base64!!").is_none());
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .register_asynchronous_uri_scheme_protocol("hpaudio", |_app, request, responder| {
-            let b64 = request
-                .uri()
-                .path()
-                .trim_start_matches('/')
-                .to_string();
+            let b64 = request.uri().path().trim_start_matches('/').to_string();
             let range = request
                 .headers()
                 .get("range")
@@ -285,4 +262,25 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::b64url_decode;
+
+    #[test]
+    fn decodes_base64url_from_the_frontend() {
+        // produced by the UI's btoa(...) encoder for the URL asserted below
+        let encoded = "aHR0cDovLzE5Mi4xNjguMS4xMDo0NTMzL3Jlc3Qvc3RyZWFtP3U9YWRtaW4mdD1hYmMxMjMmcz14eSZ2PTEuMTYuMSZjPWhvcnJpcGxheWVyJmY9anNvbiZpZD10ci00Mn7EhcSZ";
+        let decoded = String::from_utf8(b64url_decode(encoded).expect("decodes")).expect("utf-8");
+        assert_eq!(
+            decoded,
+            "http://192.168.1.10:4533/rest/stream?u=admin&t=abc123&s=xy&v=1.16.1&c=horriplayer&f=json&id=tr-42~ąę"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(b64url_decode("not base64!!").is_none());
+    }
 }

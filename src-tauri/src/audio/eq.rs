@@ -253,7 +253,10 @@ mod tests {
             (corner - 3.0).abs() < 1.0,
             "31 Hz should sit near +3 dB, got {corner:.2} dB"
         );
-        assert!(high.abs() < 0.5, "8 kHz should be untouched, got {high:.2} dB");
+        assert!(
+            high.abs() < 0.5,
+            "8 kHz should be untouched, got {high:.2} dB"
+        );
     }
 
     #[test]
@@ -265,7 +268,10 @@ mod tests {
         let gains = [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         eq.set_params(&gains, 0.0, true);
         let bass = gain_at(&mut eq, fs, 80.0);
-        assert!(bass > 3.0, "80 Hz should be clearly lifted, got {bass:.2} dB");
+        assert!(
+            bass > 3.0,
+            "80 Hz should be clearly lifted, got {bass:.2} dB"
+        );
     }
 
     #[test]
