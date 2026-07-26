@@ -16,12 +16,35 @@ permissions:
   contents: write
 
 jobs:
+  # Fail in seconds on a typo'd or missing tag, rather than after the full test
+  # matrix has run and checkout finally trips over it.
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag exists
+        run: |
+          tag='${{ inputs.tag }}'
+          if ! git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Tag '$tag' does not exist. Create and push it first:"
+            echo "::error::  git tag -a $tag -m 'HorriPlayer $tag' && git push origin $tag"
+            echo "Existing tags:"
+            git tag --list --sort=-v:refname | head -10
+            exit 1
+          fi
+          echo "$tag -> $(git rev-parse --short "refs/tags/$tag")"
+
   test:
+    needs: validate
     uses: ./.github/workflows/ci.yml
 
   build:
     name: Build (${{ matrix.label }})
-    needs: test
+    needs: [validate, test]
     # Optional second gate: define an environment named `release` in the repo
     # settings with required reviewers, and this job waits for approval.
     environment: release
